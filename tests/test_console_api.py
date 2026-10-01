@@ -47,13 +47,43 @@ def test_console_actions_and_rejections(platform):
         assert _post(f"{base}/api/pressurize", {"charge_kg": 12.0})[1]["ok"] is True
         assert _post(f"{base}/api/fill", {"steps": 2})[1]["ok"] is True
         assert _post(f"{base}/api/stop", {})[1]["ok"] is True
-        assert _post(f"{base}/api/leak/sample", {"concentration_ppm": 4500.0})[1]["tripped"] is True
-        status, payload = _post(f"{base}/api/leak/reset", {})
+        assert _post(f"{base}/api/leak/sample", {"zone": "unload", "concentration_ppm": 4500.0})[1]["tripped"] is True
+        status, payload = _post(f"{base}/api/leak/reset", {"zone": "unload"})
         assert status == 409
         assert payload["error"] == "LeakError"
         resolved = _get(f"{base}/api/namespace/station.vent")
         assert resolved[0] == 200
         assert resolved[1]["device"]["kind"] == "vent-valve"
+    finally:
+        server.stop()
+
+
+def test_console_leak_zone_endpoints(platform):
+    server = ConsoleServer(platform, port=0)
+    base = server.start()
+    try:
+        code, payload = _get(f"{base}/api/leak/zones")
+        assert code == 200
+        assert payload["leak"]["zoning_basis"] == "physical_zone"
+        assert len(payload["leak"]["zones"]) == 4
+
+        code, payload = _post(
+            f"{base}/api/leak/sample-batch",
+            {"readings": {"compression": 9000.0, "storage": 8000.0, "unload": 0.0, "dispense": 0.0}},
+        )
+        assert code == 200
+        assert payload["multi_point"] is True
+        assert payload["tripped_zones"] == ["compression", "storage"]
+
+        code, payload = _post(f"{base}/api/leak/zones/compression/offline", {})
+        assert code == 200 and payload["isolated"] is True
+        code, payload = _get(f"{base}/api/leak/zones/compression")
+        assert code == 200
+        assert payload["zone"]["probe_online"] is False
+        assert payload["zone"]["isolated"] is True
+
+        code, payload = _post(f"{base}/api/leak/zones/unknown/sample", {"concentration_ppm": 1.0})
+        assert code == 409 and payload["error"] == "LeakError"
     finally:
         server.stop()
 

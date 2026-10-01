@@ -32,9 +32,7 @@ from .flow.meter import MassFlowMeter
 from .flow.snapshot import FlowSnapshot
 from .flow.step import FlowStep
 from .ids import IdFactory
-from .leak.detector import LeakDetector
-from .leak.latch import LeakLatch
-from .leak.snapshot import LeakSnapshot
+from .leak.controller import DEFAULT_LEAK_ZONE, LeakZoneController
 from .ns.registry import NamespaceRegistry
 from .ns.topology import Topology, build_default_topology
 from .queue.confirm import Confirmation
@@ -51,6 +49,12 @@ from .vent.valve import VentValve
 
 DEFAULT_UNIT = "station1"
 DEFAULT_VEHICLE = "vehicle01"
+
+# 工艺操作落在哪一个物理分区：泄漏隔离按区联锁，只挡住受影响那一路，
+# 其他物理分区的操作仍可继续。
+UNLOAD_ZONE = "unload"
+PRESSURIZE_ZONE = "compression"
+FILL_ZONE = "dispense"
 
 
 class Platform:
@@ -99,8 +103,7 @@ class Platform:
             self.config.buffer.target_pressure_mpa + self.config.buffer.pressure_tolerance_mpa,
             self.config.buffer.target_pressure_mpa,
         )
-        self.leak = LeakDetector(self.config.leak)
-        self.leak_latch = LeakLatch(self.config.leak.hold_s)
+        self.leak = LeakZoneController(self.clock, self.bus, self.config.leak)
         self.queue = FillQueue(self.config.queue)
         self.confirm = Confirmation(self.config.queue.confirm_timeout_s)
 
@@ -124,10 +127,14 @@ class Platform:
             ("station", "dispenser", "fill-dispenser"),
             ("station", "nozzle", "fill-nozzle"),
             ("station", "flowmeter", "mass-flow-meter"),
-            ("station", "leak", "leak-detector"),
             ("station", "queue", "fill-queue"),
         ):
             self.namespaces.register(area, device, kind)
+        # 泄漏检测按物理分区多路布置：每区一个探头加一只隔离阀，
+        # 地址里直接带物理区标识，控制台与审计据此归因到具体哪一路。
+        for zone in self.config.leak.zones:
+            self.namespaces.register(zone.zone_id, "leak-probe", "leak-detector")
+            self.namespaces.register(zone.zone_id, "isolation-valve", "leak-isolation-valve")
 
     def _restore(self) -> None:
         """从落盘状态恢复平台计数，保证重启后计数连续。"""
@@ -234,6 +241,7 @@ class Platform:
 
         with self._lock:
             op_id = self.ids.next()
+            self.leak.guard(UNLOAD_ZONE)
             report = unload_truck(self.truck, self.vent, self.vent_latch, self.unit, hose_pressure_mpa, target_kg, dt)
             summary = self._record_operation(op_id, "unload", report)
             self._operations += 1
@@ -251,6 +259,7 @@ class Platform:
 
         with self._lock:
             op_id = self.ids.next()
+            self.leak.guard(PRESSURIZE_ZONE)
             report = pressurize_buffer(
                 self.compressor,
                 self.bank,
@@ -280,10 +289,11 @@ class Platform:
         with self._lock:
             op_id = self.ids.next()
             try:
+                self.leak.guard(FILL_ZONE)
                 self.dispenser.check_line_pressure(self.bank.pressure_mpa)
             except HydroError as error:
                 self.note_error(error)
-                return {"station": self.unit, "vehicle": vehicle, "ok": False, "violations": ["line_pressure_high"]}
+                return {"station": self.unit, "vehicle": vehicle, "ok": False, "violations": [error.component]}
             before = self.meter.total_kg()
             report = fill_vehicle(
                 self.dispenser,
@@ -330,24 +340,50 @@ class Platform:
             self._persist()
             return {**report, **summary}
 
-    def sample_leak(self, concentration_ppm: float) -> dict:
-        """记一次泄漏采样；达到阀值即触发并保持闩锁。"""
+    def sample_leak(self, concentration_ppm: float, zone: str | None = None) -> dict:
+        """记一次泄漏采样（旧接口：默认落在槽车卸氢物理区）。"""
 
         with self._lock:
-            result = self.leak.sample(concentration_ppm)
-            if result["tripped"] and not self.leak_latch.is_engaged(self.clock.now()):
-                self.leak_latch.engage(self.clock.now())
-            self.bus.publish(Event.of("leak", "leak", "sample", severity="alarm" if result["tripped"] else "notice", ppm=result["ppm"]))
-            result["latch_engaged"] = self.leak_latch.is_engaged(self.clock.now())
-            result["remaining_s"] = round(self.leak_latch.remaining_s(self.clock.now()), 1)
-            return result
+            return self.leak.sample_zone(zone or DEFAULT_LEAK_ZONE, concentration_ppm)
 
-    def release_leak(self) -> dict:
-        """保持期结束后复位泄漏闩锁。"""
+    def sample_leak_zone(self, zone: str, concentration_ppm: float) -> dict:
+        """对指定物理分区记一次泄漏采样，超阀值即只隔离这一路。"""
 
         with self._lock:
-            released = self.leak_latch.reset(self.clock.now())
-            return {"released": released, "cycles": self.leak_latch.cycles()}
+            return self.leak.sample_zone(zone, concentration_ppm)
+
+    def sample_leak_batch(self, readings: dict[str, float]) -> dict:
+        """一轮内对多个物理分区同时采样，区分单点与多点同时超标。"""
+
+        with self._lock:
+            return self.leak.sample_batch(readings)
+
+    def mark_probe_offline(self, zone: str) -> dict:
+        """标记某分区泄漏探头掉线：部分失败按有泄漏处理并隔离本区。"""
+
+        with self._lock:
+            return self.leak.probe_offline(zone)
+
+    def mark_probe_online(self, zone: str) -> dict:
+        """标记某分区泄漏探头重新上线。"""
+
+        with self._lock:
+            return self.leak.probe_online(zone)
+
+    def release_leak(self, zone: str | None = None) -> dict:
+        """人工复位一个物理分区（旧接口：复位默认物理区）。
+
+        保持期未满或泄漏未消干净（含探头掉线）时抛出 :class:`LeakError`。
+        """
+
+        with self._lock:
+            return self.leak.reset_zone(zone or DEFAULT_LEAK_ZONE)
+
+    def reset_leak_zone(self, zone: str) -> dict:
+        """人工复位指定物理分区。"""
+
+        with self._lock:
+            return self.leak.reset_zone(zone)
 
     def calibrate_baseline(self, target_mpa: float) -> dict:
         """重新标定瓶组压力基线，返回标定前后的差值。"""
@@ -404,12 +440,13 @@ class Platform:
         """汇总加注就绪判据，供控制台与巡检使用。"""
 
         fill_stage = self.topology.stage("fill")
+        isolated = self.leak.isolated_zones()
         checks = {
             "running": self._running,
             "precool_ready": self.precooler.is_ready(),
             "temperature_in_band": self.temperature.reached(),
             "nozzle_latched": self.nozzle.is_latched(),
-            "leak_latch_clear": not self.leak_latch.is_engaged(self.clock.now()),
+            "leak_latch_clear": FILL_ZONE not in isolated,
             "confirm_idle": not self.confirm.pending(DEFAULT_VEHICLE),
         }
         recent = self.audit.tail(1)
@@ -418,6 +455,8 @@ class Platform:
             "checks": checks,
             "stage": {"name": fill_stage.name, "label": fill_stage.label, "requires": list(self.topology.predecessors("fill"))},
             "outstanding_confirms": self.confirm.outstanding(),
+            "isolated_leak_zones": isolated,
+            "offline_leak_zones": self.leak.offline_zones(),
             "last_audit_ts": recent[-1]["ts"] if recent else None,
         }
 
@@ -429,7 +468,11 @@ class Platform:
         with self._lock:
             self._cycles += 1
             moment = self.clock.now()
-            blocked = self.leak_latch.is_engaged(moment)
+            # 控制周期驱动泄漏分区：保持期走完且泄漏消干净的自动恢复区在此
+            # 自动开阀；人工复位区与未消干净的分区一律继续隔离。
+            auto_recovered = self.leak.tick()
+            isolated = self.leak.isolated_zones()
+            blocked = bool(isolated)
             for vehicle in self.confirm.outstanding():
                 if self.confirm.expired(vehicle, moment):
                     self.confirm.clear(vehicle)
@@ -450,7 +493,10 @@ class Platform:
                 "headroom_kg": round(self.bank.headroom_kg(), 3),
                 "queue_size": self.queue.size(),
                 "outstanding_confirms": self.confirm.outstanding(),
-                "leak_tripped": self.leak.tripped(),
+                "leak_tripped": bool(isolated),
+                "isolated_leak_zones": isolated,
+                "offline_leak_zones": self.leak.offline_zones(),
+                "leak_auto_recovered": auto_recovered,
             }
 
     def concurrency_probe(self, rounds: int = 24) -> dict:
@@ -528,7 +574,7 @@ class Platform:
             self.temperature.reset()
             self.precooler.reset()
             self.meter.reset()
-            self.leak.reset()
+            self.leak.reset_all()
             self.dispenser.reset()
             self.queue.reset()
             removed = self.store.remove("platform_state") if self.store.exists("platform_state") else False
@@ -606,17 +652,9 @@ class Platform:
         return self.dispenser.snapshot().as_dict()
 
     def leak_snapshot(self) -> dict:
-        """返回泄漏检测状态快照。"""
+        """返回分物理区泄漏检测状态快照（含阀位与多路归因）。"""
 
-        now = self.clock.now()
-        return LeakSnapshot(
-            peak_ppm=self.leak.peak_ppm(),
-            threshold_ppm=self.config.leak.threshold_ppm,
-            tripped=self.leak.tripped(),
-            latch_engaged=self.leak_latch.is_engaged(now),
-            remaining_s=self.leak_latch.remaining_s(now),
-            cycles=self.leak_latch.cycles(),
-        ).as_dict()
+        return self.leak.summary()
 
     def queue_snapshot(self) -> dict:
         """返回加注队列状态快照。"""
@@ -666,7 +704,7 @@ class Platform:
                 "writers": self.setpoint.writers(),
             },
             "confirm_timeout_s": self.confirm.timeout_s,
-            "leak_samples": self.leak.samples(),
+            "leak_samples": self.leak.total_samples(),
             "last_audit_ts": self._last_audit_ts,
             "audit": self.audit.summary(),
         }

@@ -75,9 +75,12 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     fill = platform.fill(vehicle="vehicle01", rate_kg_per_min=3.0, steps=args.steps)
     stop = platform.stop_fill()
     cycles = [platform.cycle(dt=1.0) for _ in range(6)]
-    leak = platform.sample_leak(concentration_ppm=4200.0)
+    # 泄漏按物理分区多路检测：在加注岛区采一次超标，只隔离加注岛这一路；
+    # 保持期走完且浓度回落后，自动恢复区由控制周期自动开阀。
+    leak = platform.sample_leak_zone("dispense", 4200.0)
     clock.advance(config.leak.hold_s + 1.0)
-    leak_reset = platform.release_leak()
+    leak_clear = platform.sample_leak_zone("dispense", 100.0)
+    leak_reset = platform.cycle(dt=1.0)
     concurrency = platform.concurrency_probe(rounds=args.rounds)
     calibration = platform.calibrate_baseline(target_mpa=42.0)
     shutdown = platform.stop()

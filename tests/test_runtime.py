@@ -33,7 +33,10 @@ def test_concurrency_probe_converges(platform):
 
 def test_namespace_resolution(platform):
     assert platform.namespace("station.vent")["kind"] == "vent-valve"
-    assert platform.namespaces_describe()["count"] == 10
+    # 9 个工艺设备 + 4 个物理分区各一只探头与一只隔离阀。
+    assert platform.namespaces_describe()["count"] == 17
+    assert platform.namespace("unload.leak-probe")["kind"] == "leak-detector"
+    assert platform.namespace("dispense.isolation-valve")["kind"] == "leak-isolation-valve"
 
 
 def test_reset_state_clears_counts(platform):

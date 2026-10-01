@@ -50,7 +50,14 @@
     "leak": {
       "threshold_ppm": 4000.0,
       "sample_window_s": 5.0,
-      "hold_s": 30.0
+      "hold_s": 30.0,
+      "zoning_basis": "physical_zone",
+      "zones": [
+        {"id": "unload", "label": "槽车卸氢区", "auto_reset": false},
+        {"id": "compression", "label": "压缩增压区", "auto_reset": false},
+        {"id": "storage", "label": "储氢瓶组区", "auto_reset": false},
+        {"id": "dispense", "label": "加注岛区", "auto_reset": true}
+      ]
     },
     "queue": {
       "max_waiting": 12,

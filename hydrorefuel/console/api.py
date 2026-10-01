@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from ..app import Platform
 from ..audit.timeline import build_timeline
-from ..errors import HydroError
+from ..errors import HydroError, LeakError
 from .router import Router
 
 
@@ -63,7 +63,14 @@ class Api:
         add("POST", "/api/fill", self._fill)
         add("POST", "/api/stop", self._stop)
         add("POST", "/api/leak/sample", self._leak_sample)
-        add("POST", "/api/leak/reset", lambda params, body: self._platform.release_leak())
+        add("POST", "/api/leak/reset", self._leak_reset)
+        add("GET", "/api/leak/zones", lambda params, body: {"leak": self._platform.leak_snapshot()})
+        add("GET", "/api/leak/zones/{zone}", self._leak_zone)
+        add("POST", "/api/leak/zones/{zone}/sample", self._leak_zone_sample)
+        add("POST", "/api/leak/sample-batch", self._leak_sample_batch)
+        add("POST", "/api/leak/zones/{zone}/reset", self._leak_zone_reset)
+        add("POST", "/api/leak/zones/{zone}/offline", self._leak_probe_offline)
+        add("POST", "/api/leak/zones/{zone}/online", self._leak_probe_online)
         add("POST", "/api/calibrate", self._calibrate)
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/enqueue", self._enqueue)
@@ -169,7 +176,45 @@ class Api:
         return self._platform.stop_fill()
 
     def _leak_sample(self, params: dict, body: dict) -> dict:
-        return self._platform.sample_leak(_as_float(body, "concentration_ppm", 0.0))
+        zone = body.get("zone")
+        return self._platform.sample_leak(
+            _as_float(body, "concentration_ppm", 0.0),
+            zone=str(zone) if zone is not None else None,
+        )
+
+    def _leak_reset(self, params: dict, body: dict) -> dict:
+        zone = body.get("zone")
+        return self._platform.release_leak(zone=str(zone) if zone is not None else None)
+
+    def _leak_zone(self, params: dict, body: dict) -> dict:
+        zone_id = str(params.get("zone", ""))
+        summary = self._platform.leak_snapshot()
+        for zone in summary["zones"]:
+            if zone["zone"] == zone_id:
+                return {"zone": zone}
+        raise LeakError(f"未知泄漏分区: {zone_id}", component="leak")
+
+    def _leak_zone_sample(self, params: dict, body: dict) -> dict:
+        return self._platform.sample_leak_zone(
+            str(params.get("zone", "")),
+            _as_float(body, "concentration_ppm", 0.0),
+        )
+
+    def _leak_sample_batch(self, params: dict, body: dict) -> dict:
+        raw = body.get("readings", body)
+        if not isinstance(raw, dict):
+            raise HydroError("readings 必须是 {分区: 浓度} 映射", component="console")
+        readings = {str(zone): _as_float(raw, zone, 0.0) for zone in raw}
+        return self._platform.sample_leak_batch(readings)
+
+    def _leak_zone_reset(self, params: dict, body: dict) -> dict:
+        return self._platform.reset_leak_zone(str(params.get("zone", "")))
+
+    def _leak_probe_offline(self, params: dict, body: dict) -> dict:
+        return self._platform.mark_probe_offline(str(params.get("zone", "")))
+
+    def _leak_probe_online(self, params: dict, body: dict) -> dict:
+        return self._platform.mark_probe_online(str(params.get("zone", "")))
 
     def _calibrate(self, params: dict, body: dict) -> dict:
         return self._platform.calibrate_baseline(
