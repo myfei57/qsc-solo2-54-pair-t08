@@ -16,6 +16,8 @@ def test_leak_latch_holds_until_hold_expires(platform, clock):
         platform.release_leak()
     clock.advance(platform.config.leak.hold_s + 1.0)
     assert platform.leak_latch.is_engaged(clock.now()) is False
+    # 泄漏消除（读数回落）之后，人工复位才会被接受。
+    platform.sample_leak(100.0)
     assert platform.release_leak()["released"] is True
     assert platform.leak_latch.cycles() == 1
 

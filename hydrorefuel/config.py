@@ -234,24 +234,87 @@ class DispenserLimits:
         return limits
 
 
+RECOVERY_POLICIES = ("auto", "manual")
+
+
+@dataclass(frozen=True)
+class LeakZoneSpec:
+    """一个泄漏检测分区。
+
+    分区划分定死为**按管路分支**：一个分区就是一条分支上的最小可隔离单元
+    （一台隔离阀 + 至少一支探头），隔离、复位与审计都以分区为单位。
+    ``area`` 是物理分区名，只供控制台分组展示，不参与控制口径。
+    ``recovery`` 决定泄漏消除后是自动恢复（``auto``）还是必须人工复位
+    （``manual``）。
+    """
+
+    name: str
+    branch: str
+    area: str
+    recovery: str
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "LeakZoneSpec":
+        name = section.get("name")
+        branch = section.get("branch")
+        area = section.get("area", "")
+        recovery = section.get("recovery", "manual")
+        if not isinstance(name, str) or not name:
+            raise ConfigError("泄漏分区 name 必须是非空字符串", component="config")
+        if not isinstance(branch, str) or not branch:
+            raise ConfigError("泄漏分区 branch 必须是非空字符串", component="config")
+        if not isinstance(area, str):
+            raise ConfigError("泄漏分区 area 必须是字符串", component="config")
+        if recovery not in RECOVERY_POLICIES:
+            raise ConfigError(f"泄漏分区 recovery 必须是 {RECOVERY_POLICIES} 之一", component="config")
+        return cls(name=name, branch=branch, area=area or name, recovery=recovery)
+
+
 @dataclass(frozen=True)
 class LeakLimits:
-    """泄漏阀值与闩锁保持约束。"""
+    """泄漏阀值、闩锁保持与分区约束。"""
 
     threshold_ppm: float
     sample_window_s: float
     hold_s: float
+    zones: tuple[LeakZoneSpec, ...] = ()
+    incident_window_s: float = 10.0
+
+    def __post_init__(self) -> None:
+        if self.hold_s <= self.sample_window_s:
+            raise ConfigError("泄漏闩锁保持时长必须大于采样窗口", component="config")
+        if not self.zones:
+            raise ConfigError("至少配置一个泄漏检测分区", component="config")
+        names = [zone.name for zone in self.zones]
+        branches = [zone.branch for zone in self.zones]
+        if len(set(names)) != len(names):
+            raise ConfigError("泄漏分区名称不能重复", component="config")
+        if len(set(branches)) != len(branches):
+            raise ConfigError("一条管路分支只能划一个泄漏分区", component="config")
+        if self.incident_window_s <= 0:
+            raise ConfigError("泄漏事件关联窗口必须为正", component="config")
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "LeakLimits":
-        limits = cls(
+        raw_zones = section.get("zones")
+        zones: tuple[LeakZoneSpec, ...]
+        if raw_zones is None:
+            # 旧配置没有分区段落：按单探头语义合成一个加注分支人工复位分区。
+            zones = (LeakZoneSpec("dispenser", "dispenser", "加注区", "manual"),)
+        else:
+            if not isinstance(raw_zones, list) or not raw_zones:
+                raise ConfigError("leak.zones 必须是非空列表", component="config")
+            zones = tuple(LeakZoneSpec.from_mapping(item) for item in raw_zones)
+        incident_window_s = section.get("incident_window_s", 10.0)
+        if isinstance(incident_window_s, bool) or not isinstance(incident_window_s, (int, float)):
+            raise ConfigError("配置字段 'incident_window_s' 必须是数值", component="config")
+        return cls(
             threshold_ppm=_number(section, "threshold_ppm", minimum=1.0),
             sample_window_s=_number(section, "sample_window_s", minimum=0.1),
             hold_s=_number(section, "hold_s", minimum=1.0),
+            zones=zones,
+            incident_window_s=float(incident_window_s),
         )
-        if limits.hold_s <= limits.sample_window_s:
-            raise ConfigError("泄漏闩锁保持时长必须大于采样窗口", component="config")
-        return limits
 
     def tripped(self, concentration_ppm: float) -> bool:
         """浓度是否达到泄漏阀值。"""
@@ -341,7 +404,19 @@ def default_config() -> StationConfig:
         cool=CoolLimits(-40.0, 3.0, 0.6, 20.0),
         flow=FlowLimits(1.8, 0.15, 3.6, 0.4),
         dispenser=DispenserLimits(55.0, 15.0, 44.0, 2.0),
-        leak=LeakLimits(4000.0, 5.0, 30.0),
+        leak=LeakLimits(
+            4000.0,
+            5.0,
+            30.0,
+            zones=(
+                # 第一个分区是主分区：兼容单探头时代的 sample_leak/release_leak。
+                LeakZoneSpec("dispenser", "dispenser", "加注区", "manual"),
+                LeakZoneSpec("unload", "unload", "卸车区", "auto"),
+                LeakZoneSpec("compressor", "compressor", "压缩区", "auto"),
+                LeakZoneSpec("buffer", "buffer", "储氢区", "manual"),
+            ),
+            incident_window_s=10.0,
+        ),
         queue=QueueLimits(12, 45.0),
     )
 
@@ -399,6 +474,11 @@ def config_to_mapping(cfg: StationConfig) -> dict:
                 "threshold_ppm": cfg.leak.threshold_ppm,
                 "sample_window_s": cfg.leak.sample_window_s,
                 "hold_s": cfg.leak.hold_s,
+                "incident_window_s": cfg.leak.incident_window_s,
+                "zones": [
+                    {"name": zone.name, "branch": zone.branch, "area": zone.area, "recovery": zone.recovery}
+                    for zone in cfg.leak.zones
+                ],
             },
             "queue": {
                 "max_waiting": cfg.queue.max_waiting,

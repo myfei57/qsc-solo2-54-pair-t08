@@ -77,7 +77,14 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     cycles = [platform.cycle(dt=1.0) for _ in range(6)]
     leak = platform.sample_leak(concentration_ppm=4200.0)
     clock.advance(config.leak.hold_s + 1.0)
+    # 泄漏消除（读数回落）后人工复位主分区；未消干净时复位会被联锁拒绝。
+    leak_cleared = platform.sample_leak(concentration_ppm=120.0)
     leak_reset = platform.release_leak()
+    # 演示分区隔离：卸车分支超标只隔离该分支，消隐后按分区策略自动恢复。
+    zone_trip = platform.sample_leak_zone("unload", 4600.0)
+    clock.advance(config.leak.hold_s + 1.0)
+    zone_recovered = platform.sample_leak_zone("unload", 80.0)
+    leak_zones = platform.leak_zones_snapshot()
     concurrency = platform.concurrency_probe(rounds=args.rounds)
     calibration = platform.calibrate_baseline(target_mpa=42.0)
     shutdown = platform.stop()
@@ -98,7 +105,15 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
         "leak": leak,
+        "leak_cleared": leak_cleared,
         "leak_reset": leak_reset,
+        "zone_trip": {"zone": zone_trip["name"], "transition": zone_trip["transition"]},
+        "zone_recovered": {"zone": zone_recovered["name"], "transition": zone_recovered["transition"]},
+        "leak_zones": {
+            "isolated_zones": leak_zones["isolated_zones"],
+            "degraded": leak_zones["degraded"],
+            "incidents_total": leak_zones["incidents"]["total"],
+        },
         "concurrency": concurrency,
         "calibration": calibration,
         "shutdown": shutdown,
@@ -112,6 +127,10 @@ def _cmd_demo(args: argparse.Namespace) -> int:
             failures.extend(operation["violations"])
     if not stop["ok"]:
         failures.append("stop_fill_not_completed")
+    if not leak_reset["released"]:
+        failures.append("leak_reset_not_released")
+    if leak_zones["isolated_zones"]:
+        failures.append("leak_zones_still_isolated")
     if failures:
         print(f"检查未通过: {failures}", file=sys.stderr)
         return 1

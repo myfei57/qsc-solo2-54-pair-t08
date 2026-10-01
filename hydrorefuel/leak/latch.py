@@ -68,3 +68,11 @@ class LeakLatch:
         """返回累计触发次数。"""
 
         return self._cycles
+
+    def force_release(self) -> bool:
+        """交付前重新标定时强制释放闩锁（不走保持期校验），返回之前是否咬合。"""
+
+        with self._lock:
+            was_engaged = self._engaged
+            self._engaged = False
+            return was_engaged

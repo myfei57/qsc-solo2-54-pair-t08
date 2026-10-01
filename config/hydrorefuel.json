@@ -50,7 +50,14 @@
     "leak": {
       "threshold_ppm": 4000.0,
       "sample_window_s": 5.0,
-      "hold_s": 30.0
+      "hold_s": 30.0,
+      "incident_window_s": 10.0,
+      "zones": [
+        {"name": "dispenser", "branch": "dispenser", "area": "加注区", "recovery": "manual"},
+        {"name": "unload", "branch": "unload", "area": "卸车区", "recovery": "auto"},
+        {"name": "compressor", "branch": "compressor", "area": "压缩区", "recovery": "auto"},
+        {"name": "buffer", "branch": "buffer", "area": "储氢区", "recovery": "manual"}
+      ]
     },
     "queue": {
       "max_waiting": 12,

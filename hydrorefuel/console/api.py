@@ -21,6 +21,15 @@ def _as_float(body: dict, key: str, default: float) -> float:
         raise HydroError(f"参数 {key!r} 必须是数值", component="console") from error
 
 
+def _as_bool(body: dict, key: str, default: bool) -> bool:
+    value = body.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "0", "no", "off")
+    return bool(value)
+
+
 class Api:
     """把 HTTP 请求翻译成平台调用。"""
 
@@ -49,6 +58,8 @@ class Api:
         add("GET", "/api/flow", lambda params, body: {"flow": self._platform.flow_snapshot()})
         add("GET", "/api/disp", lambda params, body: {"disp": self._platform.disp_snapshot()})
         add("GET", "/api/leak", lambda params, body: {"leak": self._platform.leak_snapshot()})
+        add("GET", "/api/leak/zones", lambda params, body: {"leak_zones": self._platform.leak_zones_snapshot()})
+        add("GET", "/api/leak/incidents", lambda params, body: self._platform.leak_incidents())
         add("GET", "/api/queue", lambda params, body: {"queue": self._platform.queue_snapshot()})
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/alarms", lambda params, body: {"alarms": self._platform.audit.alarms()})
@@ -64,6 +75,8 @@ class Api:
         add("POST", "/api/stop", self._stop)
         add("POST", "/api/leak/sample", self._leak_sample)
         add("POST", "/api/leak/reset", lambda params, body: self._platform.release_leak())
+        add("POST", "/api/leak/zones/{zone}/sample", self._leak_zone_sample)
+        add("POST", "/api/leak/zones/{zone}/reset", self._leak_zone_reset)
         add("POST", "/api/calibrate", self._calibrate)
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/enqueue", self._enqueue)
@@ -170,6 +183,19 @@ class Api:
 
     def _leak_sample(self, params: dict, body: dict) -> dict:
         return self._platform.sample_leak(_as_float(body, "concentration_ppm", 0.0))
+
+    def _leak_zone_sample(self, params: dict, body: dict) -> dict:
+        concentration = body.get("concentration_ppm")
+        return self._platform.sample_leak_zone(
+            str(params.get("zone", "")),
+            None if concentration is None else _as_float(body, "concentration_ppm", 0.0),
+            probe_ok=_as_bool(body, "probe_ok", True),
+        )
+
+    def _leak_zone_reset(self, params: dict, body: dict) -> dict:
+        return self._platform.reset_leak_zone(
+            str(params.get("zone", "")), actor=str(body.get("actor", "console"))
+        )
 
     def _calibrate(self, params: dict, body: dict) -> dict:
         return self._platform.calibrate_baseline(
